@@ -1,152 +1,114 @@
-# USAGE:
-# python cheque.py --image example_check.png --reference micr_e13b_reference.png
+# USAGE: python cheque.py --image check.jpg
 
-# Import required packages
-from skimage.segmentation import clear_border
-from imutils import contours
+import cv2
+import pytesseract
 import numpy as np
 import argparse
 import imutils
-import cv2
-import pytesseract  # For OCR
+import re
 
-# Function to extract digits and symbols
-def extract_digits_and_symbols(image, charCnts, minW=5, minH=15):
-    charIter = charCnts.__iter__()
-    rois = []
-    locs = []
+# Function to extract the cheque issuer's name (Top-Left Region)
+def extract_issuer_name(image):
+    h, w = image.shape[:2]
+    name_roi = image[int(h * 0.08):int(h * 0.20), int(w * 0.05):int(w * 0.50)]
 
-    while True:
-        try:
-            c = next(charIter)
-            (cX, cY, cW, cH) = cv2.boundingRect(c)
-            roi = None
+    gray = cv2.cvtColor(name_roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.convertScaleAbs(gray, alpha=3, beta=15)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
 
-            if cW >= minW and cH >= minH:
-                roi = image[cY:cY + cH, cX:cX + cW]
-                rois.append(roi)
-                locs.append((cX, cY, cX + cW, cY + cH))
-            else:
-                parts = [c, next(charIter), next(charIter)]
-                (sXA, sYA, sXB, sYB) = (np.inf, np.inf, -np.inf, -np.inf)
+    cv2.imshow("Issuer Name ROI", thresh)
+    cv2.waitKey(10000)
+    cv2.destroyAllWindows()
 
-                for p in parts:
-                    (pX, pY, pW, pH) = cv2.boundingRect(p)
-                    sXA = min(sXA, pX)
-                    sYA = min(sYA, pY)
-                    sXB = max(sXB, pX + pW)
-                    sYB = max(sYB, pY + pH)
+    raw_text = pytesseract.image_to_string(thresh, config="--psm 7 --oem 3", lang="eng").strip()
+    name_match = re.findall(r'[A-Za-z\s]+', raw_text)
+    return name_match[0].strip() if name_match else "❌ Not Detected"
 
-                roi = image[sYA:sYB, sXA:sXB]
-                rois.append(roi)
-                locs.append((sXA, sYA, sXB, sYB))
+# Function to extract the receiver name (Handwritten beside "Pay to the Order of")
+def extract_receiver_name(image):
+    h, w = image.shape[:2]
 
-        except StopIteration:
-            break
+    # Crop the region where the receiver's name is located
+    receiver_roi = image[int(h * 0.35):int(h * 0.47), int(w * 0.35):int(w * 0.70)]
 
-    return (rois, locs)
+    # Convert to grayscale
+    gray = cv2.cvtColor(receiver_roi, cv2.COLOR_BGR2GRAY)
 
-# Argument parsing
+    # Increase contrast
+    gray = cv2.convertScaleAbs(gray, alpha=3, beta=15)
+
+    # Apply adaptive thresholding
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 15, 4
+    )
+
+    # Debugging: Show the extracted receiver name region
+    cv2.imshow("Receiver ROI", thresh)
+    cv2.waitKey(10000)
+    cv2.destroyAllWindows()
+
+    # OCR with PSM 7 (single-line recognition)
+    raw_text = pytesseract.image_to_string(thresh, config="--psm 7 --oem 3", lang="eng").strip()
+
+    # Filter out unwanted symbols/numbers using regex
+    name_match = re.findall(r'[A-Za-z\s]+', raw_text)
+    return name_match[0].strip() if name_match else "❌ Not Detected"
+
+
+# Function to extract and format the amount correctly
+def extract_amount(image):
+    h, w = image.shape[:2]
+
+    # Crop the region where the amount is located
+    amount_roi = image[int(h * 0.40):int(h * 0.50), int(w * 0.60):int(w * 0.95)]
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(amount_roi, cv2.COLOR_BGR2GRAY)
+
+    # Increase contrast
+    gray = cv2.convertScaleAbs(gray, alpha=3, beta=15)
+
+    # Apply adaptive thresholding
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+
+    # Debugging: Show extracted amount region
+    cv2.imshow("Amount ROI", thresh)
+    cv2.waitKey(10000)
+    cv2.destroyAllWindows()
+
+    # OCR with PSM 6 (structured number detection)
+    raw_text = pytesseract.image_to_string(thresh, config="--psm 6 --oem 3", lang="eng").strip()
+
+    # Extract numbers and replace "," with "."
+    amount_match = re.search(r'([\d,]+\.\d{2})', raw_text.replace(",", "."))
+    return f"${amount_match.group(1)}" if amount_match else "❌ Not Detected"
+
+
+# Argument Parsing
 ap = argparse.ArgumentParser()
 ap.add_argument("-i", "--image", required=True, help="Path to input check image")
-ap.add_argument("-r", "--reference", required=True, help="Path to reference MICR E-13B font")
 args = vars(ap.parse_args())
 
-# List of MICR character names
-charNames = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "T", "U", "A", "D"]
-
-# Load the reference MICR image
-ref = cv2.imread(args["reference"])
-
-# Check if the reference image was loaded successfully
-if ref is None:
-    print(f"❌ Error: Could not load reference image '{args['reference']}'")
-    exit(1)
-
-# Convert to grayscale and resize
-ref = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
-ref = imutils.resize(ref, width=400)
-
-# Display the reference image before processing
-cv2.imshow("Reference Image", ref)
-cv2.waitKey(1000)  # Auto-close after 1 sec
-cv2.destroyAllWindows()
-
-# Improve contrast before thresholding
-ref = cv2.convertScaleAbs(ref, alpha=2, beta=10)
-
-# Apply Gaussian Blur to remove noise
-ref = cv2.GaussianBlur(ref, (5, 5), 0)
-
-# Apply thresholding
-ref = cv2.threshold(ref, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-
-# Display the processed reference image
-cv2.imshow("Thresholded Reference", ref)
-cv2.waitKey(1000)
-cv2.destroyAllWindows()
-
-# Find contours in the reference image
-refCnts = cv2.findContours(ref.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-# Ensure compatibility with OpenCV versions
-refCnts = refCnts[0] if len(refCnts) == 2 else refCnts[1]
-
-# Check if any contours were found
-if len(refCnts) == 0:
-    print("❌ Error: No contours found in the reference image.")
-    exit(1)
-
-# Sort contours from left to right
-refCnts = contours.sort_contours(refCnts, method="left-to-right")[0]
-
-# Extract digits and symbols
-(refROIs, refLocs) = extract_digits_and_symbols(ref, refCnts, minW=10, minH=20)
-chars = {}
-
-# Recognize MICR characters using OCR
-recognized_text = ""
-for (name, roi, loc) in zip(charNames, refROIs, refLocs):
-    roi = cv2.resize(roi, (36, 36))  # Resize for uniform OCR processing
-    
-    # Apply OCR to recognize the character
-    text = pytesseract.image_to_string(roi, config="--psm 10 --oem 3", lang="eng").strip()
-    
-    # Append recognized text
-    recognized_text += text
-
-print("✅ Extracted MICR Text:", recognized_text)
-
-# Load the input check image
+# Load the cheque image
 image = cv2.imread(args["image"])
-
-# Check if the check image was loaded successfully
 if image is None:
-    print(f"❌ Error: Could not load check image '{args['image']}'")
+    print(f"❌ Error: Could not load cheque image '{args['image']}'")
     exit(1)
 
-# Convert to grayscale
-image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-image = imutils.resize(image, width=600)
+# Preprocess the image (resize for better readability)
+image = imutils.resize(image, width=1000)
 
-# Improve contrast
-image = cv2.convertScaleAbs(image, alpha=2, beta=10)
+# Extract Details
+issuer_name = extract_issuer_name(image)
+receiver_name = extract_receiver_name(image)
+cheque_amount = extract_amount(image)
 
-# Apply Gaussian blur
-image = cv2.GaussianBlur(image, (5, 5), 0)
-
-# Apply thresholding
-image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-
-# Display the processed check image
-cv2.imshow("Processed Check Image", image)
-cv2.waitKey(1000)
-cv2.destroyAllWindows()
-
-# Apply OCR to extract text from the cheque
-cheque_text = pytesseract.image_to_string(image, config="--psm 6 --oem 3", lang="eng").strip()
-
-# Print the extracted text from the cheque
-print("✅ Extracted Cheque Text:", cheque_text)
-
+# Display Results
+print(f"✅ Cheque Issuer Name: {issuer_name}")
+print(f"✅ Cheque Receiver Name: {receiver_name}")
+print(f"✅ Extracted Amount: {cheque_amount}")
 print("🎯 Processing complete!")
